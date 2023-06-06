@@ -269,6 +269,8 @@ class DataLoader(Generic[T_co]):
             self.shuffle_size = int(round(shuffle_ratio * len(self.dataset)))
         else:
             self.shuffle_size = None
+        self.in_order_dataset = dataset
+        self.reverse_dataset = copy.deepcopy(self._reverse_dataset())
 
         # Adds forward compatibilities so classic DataLoader can work with DataPipes:
         #   _DataPipeSerializationWrapper container makes it easier to serialize without redefining pickler
@@ -389,6 +391,19 @@ class DataLoader(Generic[T_co]):
 
         torch.set_vital('Dataloader', 'enabled', 'True')  # type: ignore[attr-defined]
 
+    # reverse
+    def _reverse_dataset(self):
+        if self.shuffle_size:
+            length = self.shuffle_size
+        else:
+            length = int(round(0.1 * len(self.dataset)))
+        offsets = torch.arange(0, len(self.dataset), length)
+        indices = [torch.arange(offset, offset + length) for offset in offsets]
+        indices[-1] = torch.arange(offsets[-1], len(self.dataset))
+        sub_dataset = [Subset(self.dataset, index) for index in indices]
+        sub_dataset = reversed(sub_dataset)
+        return ConcatDataset(sub_dataset)
+
     def _get_iterator(self) -> '_BaseDataLoaderIter':
         if self.num_workers == 0:
             return _SingleProcessDataLoaderIter(self)
@@ -435,6 +450,11 @@ class DataLoader(Generic[T_co]):
     # We quote '_BaseDataLoaderIter' since it isn't defined yet and the definition can't be moved up
     # since '_BaseDataLoaderIter' references 'DataLoader'.
     def __iter__(self) -> '_BaseDataLoaderIter':
+        if not (self.in_order):
+            self.dataset = self.reverse_dataset
+        else:
+            self.dataset = self.in_order_dataset
+        self.in_order = not(self.in_order)
         # When using a single worker the returned iterator should be
         # created everytime to avoid resetting its state
         # However, in the case of a multiple workers iterator
