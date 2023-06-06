@@ -12,6 +12,7 @@ import os
 import queue
 import threading
 import warnings
+import copy
 
 from typing import Any, Callable, Iterable, TypeVar, Generic, List, Optional, Union
 
@@ -21,7 +22,7 @@ import torch.distributed as dist
 import torch.multiprocessing as multiprocessing
 import torch.utils.data.graph_settings
 
-from torch._utils import ExceptionWrapper
+from torch._utils import ExceptionWrapper, _accumulate
 
 from . import (
     IterDataPipe,
@@ -31,7 +32,9 @@ from . import (
     SequentialSampler,
     RandomSampler,
     BatchSampler,
-    Dataset,)
+    Dataset,
+    Subset,
+    ConcatDataset)
 
 from torch.utils.data.datapipes.datapipe import _IterDataPipeSerializationWrapper, _MapDataPipeSerializationWrapper
 
@@ -231,7 +234,8 @@ class DataLoader(Generic[T_co]):
                  multiprocessing_context=None, generator=None,
                  *, prefetch_factor: Optional[int] = None,
                  persistent_workers: bool = False,
-                 pin_memory_device: str = ""):
+                 pin_memory_device: str = "",
+                 shuffle_ratio: Optional[float] = None):
         torch._C._log_api_usage_once("python.data_loader")
 
         if num_workers < 0:
@@ -260,6 +264,11 @@ class DataLoader(Generic[T_co]):
         self.timeout = timeout
         self.worker_init_fn = worker_init_fn
         self.multiprocessing_context = multiprocessing_context
+        self.in_order = True
+        if shuffle_ratio:
+            self.shuffle_size = int(round(shuffle_ratio * len(self.dataset)))
+        else:
+            self.shuffle_size = None
 
         # Adds forward compatibilities so classic DataLoader can work with DataPipes:
         #   _DataPipeSerializationWrapper container makes it easier to serialize without redefining pickler
@@ -301,7 +310,7 @@ class DataLoader(Generic[T_co]):
             # specific workers.
             if isinstance(dataset, IterDataPipe):
                 if shuffle is not None:
-                    dataset = torch.utils.data.graph_settings.apply_shuffle_settings(dataset, shuffle=shuffle)
+                    dataset = torch.utils.data.graph_settings.apply_shuffle_settings(dataset, shuffle=shuffle, buffer_size=self.shuffle_size)
             # We cannot check `shuffle is not None` here, since previously `shuffle=False` was the default.
             elif shuffle not in {False, None}:
                 raise ValueError(
@@ -417,7 +426,7 @@ class DataLoader(Generic[T_co]):
 
     def __setattr__(self, attr, val):
         if self.__initialized and attr in (
-                'batch_size', 'batch_sampler', 'sampler', 'drop_last', 'dataset', 'persistent_workers'):
+                'batch_size', 'batch_sampler', 'sampler', 'drop_last', 'in_order_dataset', 'persistent_workers'):
             raise ValueError('{} attribute should not be set after {} is '
                              'initialized'.format(attr, self.__class__.__name__))
 

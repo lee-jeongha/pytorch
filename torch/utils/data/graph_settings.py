@@ -84,7 +84,7 @@ def _is_shuffle_datapipe(datapipe: DataPipe) -> bool:
     return True
 
 
-def apply_shuffle_settings(datapipe: DataPipe, shuffle: Optional[bool] = None) -> DataPipe:
+def apply_shuffle_settings(datapipe: DataPipe, shuffle: Optional[bool] = None, buffer_size: Optional[int] = None) -> DataPipe:
     r"""
     Traverse the graph of ``DataPipes`` to find and set shuffle attribute
     to each `DataPipe` that has APIs of ``set_shuffle`` and ``set_seed``.
@@ -104,7 +104,10 @@ def apply_shuffle_settings(datapipe: DataPipe, shuffle: Optional[bool] = None) -
             "`shuffle=True` was set, but the datapipe does not contain a `Shuffler`. Adding one at the end. "
             "Be aware that the default buffer size might not be sufficient for your task."
         )
-        datapipe = datapipe.shuffle()
+        if buffer_size is not None:
+            datapipe = datapipe.shuffle(buffer_size=buffer_size)
+        else:
+            datapipe = datapipe.shuffle()
         shufflers = [datapipe, ]  # type: ignore[list-item]
 
     for shuffler in shufflers:
