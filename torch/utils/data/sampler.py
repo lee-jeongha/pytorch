@@ -5,6 +5,7 @@ from typing import Iterator, Iterable, Optional, Sequence, List, TypeVar, Generi
 
 __all__ = [
     "BatchSampler",
+    "BundleRandomSampler",
     "RandomSampler",
     "Sampler",
     "SequentialSampler",
@@ -165,6 +166,49 @@ class RandomSampler(Sampler[int]):
             for _ in range(self.num_samples // n):
                 yield from torch.randperm(n, generator=generator).tolist()
             yield from torch.randperm(n, generator=generator).tolist()[:self.num_samples % n]
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+
+class BundleRandomSampler(Sampler[int]):
+    r"""Samples elements randomly in a bundle size.
+
+    Args:
+        data_source (Dataset): dataset to sample from
+        bundle_size (int): size of bundle
+        generator (Generator): Generator used in sampling.
+    """
+    data_source: Sized
+
+    def __init__(self, data_source: Sized, bundle_size: int,
+                 num_samples: Optional[int] = None, generator=None) -> None:
+        self.data_source = data_source
+        self._num_samples = num_samples
+        self.generator = generator
+        self.bundle_size = bundle_size
+        self.offsets = torch.arange(0, len(self.data_source), self.bundle_size)
+
+    @property
+    def num_samples(self) -> int:
+        # dataset size might change at runtime
+        if self._num_samples is None:
+            return len(self.data_source)
+        return self._num_samples
+
+    def __iter__(self) -> Iterator[int]:
+        n = len(self.data_source)
+        if self.generator is None:
+            seed = int(torch.empty((), dtype=torch.int64).random_().item())
+            generator = torch.Generator()
+            generator.manual_seed(seed)
+        else:
+            generator = self.generator
+
+        for i in range(self.num_samples // self.bundle_size):
+            yield from torch.add(torch.randperm(self.bundle_size, generator=generator), self.offsets[i]).tolist()
+        yield from torch.add(torch.randperm(self.num_samples % self.bundle_size, generator=generator), self.offsets[-1]).tolist()
+
 
     def __len__(self) -> int:
         return self.num_samples

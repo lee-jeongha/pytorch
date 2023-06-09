@@ -3,6 +3,7 @@
 from torch.utils.data.sampler import (
     BatchSampler,
     RandomSampler,
+    BundleRandomSampler,
     Sampler,
     SequentialSampler,
     SubsetRandomSampler,

@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as multiprocessing
 import torch.utils.data.graph_settings
+from torch.utils.data.datapipes.iter.combinatorics import SamplerIterDataPipe
 
 from torch._utils import ExceptionWrapper, _accumulate
 
@@ -31,6 +32,7 @@ from . import (
     Sampler,
     SequentialSampler,
     RandomSampler,
+    BundleRandomSampler,
     BatchSampler,
     Dataset,
     Subset,
@@ -75,11 +77,11 @@ class _DatasetKind:
     Iterable = 1
 
     @staticmethod
-    def create_fetcher(kind, dataset, auto_collation, collate_fn, drop_last):
+    def create_fetcher(kind, dataset, auto_collation, collate_fn, drop_last, is_slice: Optional[bool] = False):
         if kind == _DatasetKind.Map:
             return _utils.fetch._MapDatasetFetcher(dataset, auto_collation, collate_fn, drop_last)
         else:
-            return _utils.fetch._IterableDatasetFetcher(dataset, auto_collation, collate_fn, drop_last)
+            return _utils.fetch._IterableDatasetFetcher(dataset, auto_collation, collate_fn, drop_last, is_slice)
 
 
 class _InfiniteConstantSampler(Sampler):
@@ -235,7 +237,8 @@ class DataLoader(Generic[T_co]):
                  *, prefetch_factor: Optional[int] = None,
                  persistent_workers: bool = False,
                  pin_memory_device: str = "",
-                 shuffle_ratio: Optional[float] = None):
+                 bundle_ratio: Optional[float] = None,
+                 alternating_order = False):
         torch._C._log_api_usage_once("python.data_loader")
 
         if num_workers < 0:
@@ -264,11 +267,18 @@ class DataLoader(Generic[T_co]):
         self.timeout = timeout
         self.worker_init_fn = worker_init_fn
         self.multiprocessing_context = multiprocessing_context
-        self.in_order = True
-        if shuffle_ratio:
-            self.shuffle_size = int(round(shuffle_ratio * len(self.dataset)))
+        # To manage data in bundles
+        if bundle_ratio:
+            self.bundle_size = int(round(bundle_ratio * len(self.dataset)))
+            length = self.bundle_size
         else:
-            self.shuffle_size = None
+            self.bundle_size = None
+            length = int(round(0.1 * len(self.dataset)))
+        self.bundle_indices = [torch.arange(offset, offset + length) for offset in torch.arange(0, len(self.dataset), length)]
+        self.bundle_indices[-1] = torch.arange(self.bundle_indices[-1][0], len(self.dataset))
+        # To change the order in turn
+        self.alternating_order = alternating_order
+        self.in_order = True
         self.in_order_dataset = dataset
         self.reverse_dataset = copy.deepcopy(self._reverse_dataset())
 
@@ -312,7 +322,7 @@ class DataLoader(Generic[T_co]):
             # specific workers.
             if isinstance(dataset, IterDataPipe):
                 if shuffle is not None:
-                    dataset = torch.utils.data.graph_settings.apply_shuffle_settings(dataset, shuffle=shuffle, buffer_size=self.shuffle_size)
+                    dataset = torch.utils.data.graph_settings.apply_shuffle_settings(dataset, shuffle=shuffle)
             # We cannot check `shuffle is not None` here, since previously `shuffle=False` was the default.
             elif shuffle not in {False, None}:
                 raise ValueError(
@@ -355,11 +365,18 @@ class DataLoader(Generic[T_co]):
 
         if sampler is None:  # give default samplers
             if self._dataset_kind == _DatasetKind.Iterable:
-                # See NOTE [ Custom Samplers and IterableDataset ]
-                sampler = _InfiniteConstantSampler()
+                if shuffle and self.bundle_size:
+                    sampler = SamplerIterDataPipe(dataset, sampler=BundleRandomSampler, 
+                    sampler_kwargs={'bundle_size':self.bundle_size, 'generator':generator})
+                else:
+                    # See NOTE [ Custom Samplers and IterableDataset ]
+                    sampler = _InfiniteConstantSampler()
             else:  # map-style
                 if shuffle:
-                    sampler = RandomSampler(dataset, generator=generator)  # type: ignore[arg-type]
+                    if not self.bundle_size:
+                        sampler = RandomSampler(dataset, generator=generator)  # type: ignore[arg-type]
+                    else:
+                        sampler = BundleRandomSampler(dataset, bundle_size=self.bundle_size, generator=generator)
                 else:
                     sampler = SequentialSampler(dataset)  # type: ignore[arg-type]
 
@@ -393,8 +410,8 @@ class DataLoader(Generic[T_co]):
 
     # reverse
     def _reverse_dataset(self):
-        if self.shuffle_size:
-            length = self.shuffle_size
+        if self.bundle_size:
+            length = self.bundle_size
         else:
             length = int(round(0.1 * len(self.dataset)))
         offsets = torch.arange(0, len(self.dataset), length)
@@ -402,6 +419,7 @@ class DataLoader(Generic[T_co]):
         indices[-1] = torch.arange(offsets[-1], len(self.dataset))
         sub_dataset = [Subset(self.dataset, index) for index in indices]
         sub_dataset = reversed(sub_dataset)
+
         return ConcatDataset(sub_dataset)
 
     def _get_iterator(self) -> '_BaseDataLoaderIter':
@@ -450,11 +468,12 @@ class DataLoader(Generic[T_co]):
     # We quote '_BaseDataLoaderIter' since it isn't defined yet and the definition can't be moved up
     # since '_BaseDataLoaderIter' references 'DataLoader'.
     def __iter__(self) -> '_BaseDataLoaderIter':
-        if not (self.in_order):
-            self.dataset = self.reverse_dataset
-        else:
-            self.dataset = self.in_order_dataset
-        self.in_order = not(self.in_order)
+        if self.alternating_order:
+            if not (self.in_order):
+                self.dataset = self.reverse_dataset
+            else:
+                self.dataset = self.in_order_dataset
+            self.in_order = not(self.in_order)
         # When using a single worker the returned iterator should be
         # created everytime to avoid resetting its state
         # However, in the case of a multiple workers iterator
@@ -613,6 +632,7 @@ class _BaseDataLoaderIter:
         ws, rank = _get_distributed_settings()
         self._world_size = ws
         self._rank = rank
+        self._shuffle = True if loader.bundle_size else False
         # for other backends, pin_memory_device need to set. if not set
         # default behaviour is CUDA device. if pin_memory_device is selected
         # and pin_memory is not set, the default behaviour false.
@@ -699,7 +719,7 @@ class _SingleProcessDataLoaderIter(_BaseDataLoaderIter):
             torch.utils.data.graph_settings.apply_sharding(self._dataset, self._world_size, self._rank)
 
         self._dataset_fetcher = _DatasetKind.create_fetcher(
-            self._dataset_kind, self._dataset, self._auto_collation, self._collate_fn, self._drop_last)
+            self._dataset_kind, self._dataset, self._auto_collation, self._collate_fn, self._drop_last, self._shuffle)
 
     def _next_data(self):
         index = self._next_index()  # may raise StopIteration
@@ -1060,7 +1080,7 @@ class _MultiProcessingDataLoaderIter(_BaseDataLoaderIter):
                       self._worker_result_queue, self._workers_done_event,
                       self._auto_collation, self._collate_fn, self._drop_last,
                       self._base_seed, self._worker_init_fn, i, self._num_workers,
-                      self._persistent_workers, self._shared_seed))
+                      self._persistent_workers, self._shared_seed, self._shuffle))
             w.daemon = True
             # NB: Process.start() actually take some time as it needs to
             #     start a process and pass the arguments over via a pipe.
