@@ -182,12 +182,15 @@ class BundleRandomSampler(Sampler[int]):
     data_source: Sized
 
     def __init__(self, data_source: Sized, bundle_size: int,
-                 num_samples: Optional[int] = None, generator=None) -> None:
+                 num_samples: Optional[int] = None, generator=None, alternating_order=True) -> None:
         self.data_source = data_source
         self._num_samples = num_samples
         self.generator = generator
         self.bundle_size = bundle_size
         self.offsets = torch.arange(0, len(self.data_source), self.bundle_size)
+        self.shuffled_list = torch.randperm(self.num_samples, generator=self.generator)
+        self.alternating_order = alternating_order
+        self.in_order = True
 
     @property
     def num_samples(self) -> int:
@@ -205,9 +208,23 @@ class BundleRandomSampler(Sampler[int]):
         else:
             generator = self.generator
 
+        if self.in_order:
+            self.offsets = torch.arange(0, len(self.data_source), self.bundle_size)
+        else:
+            #self.offsets = torch.flip(torch.arange(0, len(self.data_source), self.bundle_size), dims=[0])
+            self.offsets = torch.cat((torch.arange(len(self.data_source)-self.bundle_size, 0, -self.bundle_size), torch.zeros([1, ], dtype=torch.int32)), dim=0)
+
         for i in range(self.num_samples // self.bundle_size):
-            yield from torch.add(torch.randperm(self.bundle_size, generator=generator), self.offsets[i]).tolist()
-        yield from torch.add(torch.randperm(self.num_samples % self.bundle_size, generator=generator), self.offsets[-1]).tolist()
+            yield from self.shuffled_list[torch.add(torch.randperm(self.bundle_size, generator=generator), self.offsets[i])]#.tolist()
+            #yield from torch.add(torch.randperm(self.bundle_size, generator=generator), self.offsets[i]).tolist()
+            #yield from torch.randperm(self.bundle_size, generator=generator).tolist()
+        if (self.num_samples % self.bundle_size):
+            yield from self.shuffled_list[torch.add(torch.randperm(self.num_samples % self.bundle_size, generator=generator), self.offsets[-1])]#.tolist()
+            #yield from torch.add(torch.randperm(self.num_samples % self.bundle_size, generator=generator), self.offsets[-1]).tolist()
+            #yield from torch.randperm(self.num_samples % self.bundle_size, generator=generator).tolist()[:self.num_samples % self.bundle_size]
+
+        if self.alternating_order:
+            self.in_order = not(self.in_order)
 
 
     def __len__(self) -> int:

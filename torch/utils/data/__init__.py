@@ -43,6 +43,7 @@ from torch.utils.data.datapipes._decorator import (
 )
 
 __all__ = ['BatchSampler',
+           'BundleRandomSampler',
            'ChainDataset',
            'ConcatDataset',
            'DFIterDataPipe',

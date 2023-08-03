@@ -12,7 +12,6 @@ import os
 import queue
 import threading
 import warnings
-import copy
 
 from typing import Any, Callable, Iterable, TypeVar, Generic, List, Optional, Union
 
@@ -23,7 +22,7 @@ import torch.multiprocessing as multiprocessing
 import torch.utils.data.graph_settings
 from torch.utils.data.datapipes.iter.combinatorics import SamplerIterDataPipe
 
-from torch._utils import ExceptionWrapper, _accumulate
+from torch._utils import ExceptionWrapper
 
 from . import (
     IterDataPipe,
@@ -34,9 +33,7 @@ from . import (
     RandomSampler,
     BundleRandomSampler,
     BatchSampler,
-    Dataset,
-    Subset,
-    ConcatDataset)
+    Dataset)
 
 from torch.utils.data.datapipes.datapipe import _IterDataPipeSerializationWrapper, _MapDataPipeSerializationWrapper
 
@@ -270,17 +267,9 @@ class DataLoader(Generic[T_co]):
         # To manage data in bundles
         if bundle_ratio:
             self.bundle_size = int(round(bundle_ratio * len(self.dataset)))
-            length = self.bundle_size
         else:
             self.bundle_size = None
-            length = int(round(0.1 * len(self.dataset)))
-        self.bundle_indices = [torch.arange(offset, offset + length) for offset in torch.arange(0, len(self.dataset), length)]
-        self.bundle_indices[-1] = torch.arange(self.bundle_indices[-1][0], len(self.dataset))
-        # To change the order in turn
         self.alternating_order = alternating_order
-        self.in_order = True
-        self.in_order_dataset = dataset
-        self.reverse_dataset = copy.deepcopy(self._reverse_dataset())
 
         # Adds forward compatibilities so classic DataLoader can work with DataPipes:
         #   _DataPipeSerializationWrapper container makes it easier to serialize without redefining pickler
@@ -367,7 +356,7 @@ class DataLoader(Generic[T_co]):
             if self._dataset_kind == _DatasetKind.Iterable:
                 if shuffle and self.bundle_size:
                     sampler = SamplerIterDataPipe(dataset, sampler=BundleRandomSampler, 
-                    sampler_kwargs={'bundle_size':self.bundle_size, 'generator':generator})
+                    sampler_kwargs={'bundle_size':self.bundle_size, 'generator':generator, 'alternating_order':self.alternating_order})
                 else:
                     # See NOTE [ Custom Samplers and IterableDataset ]
                     sampler = _InfiniteConstantSampler()
@@ -376,7 +365,7 @@ class DataLoader(Generic[T_co]):
                     if not self.bundle_size:
                         sampler = RandomSampler(dataset, generator=generator)  # type: ignore[arg-type]
                     else:
-                        sampler = BundleRandomSampler(dataset, bundle_size=self.bundle_size, generator=generator)
+                        sampler = BundleRandomSampler(dataset, bundle_size=self.bundle_size, generator=generator, alternating_order=self.alternating_order)
                 else:
                     sampler = SequentialSampler(dataset)  # type: ignore[arg-type]
 
@@ -407,20 +396,6 @@ class DataLoader(Generic[T_co]):
         self.check_worker_number_rationality()
 
         torch.set_vital('Dataloader', 'enabled', 'True')  # type: ignore[attr-defined]
-
-    # reverse
-    def _reverse_dataset(self):
-        if self.bundle_size:
-            length = self.bundle_size
-        else:
-            length = int(round(0.1 * len(self.dataset)))
-        offsets = torch.arange(0, len(self.dataset), length)
-        indices = [torch.arange(offset, offset + length) for offset in offsets]
-        indices[-1] = torch.arange(offsets[-1], len(self.dataset))
-        sub_dataset = [Subset(self.dataset, index) for index in indices]
-        sub_dataset = reversed(sub_dataset)
-
-        return ConcatDataset(sub_dataset)
 
     def _get_iterator(self) -> '_BaseDataLoaderIter':
         if self.num_workers == 0:
@@ -459,7 +434,7 @@ class DataLoader(Generic[T_co]):
 
     def __setattr__(self, attr, val):
         if self.__initialized and attr in (
-                'batch_size', 'batch_sampler', 'sampler', 'drop_last', 'in_order_dataset', 'persistent_workers'):
+                'batch_size', 'batch_sampler', 'sampler', 'drop_last', 'dataset', 'persistent_workers'):
             raise ValueError('{} attribute should not be set after {} is '
                              'initialized'.format(attr, self.__class__.__name__))
 
@@ -468,12 +443,6 @@ class DataLoader(Generic[T_co]):
     # We quote '_BaseDataLoaderIter' since it isn't defined yet and the definition can't be moved up
     # since '_BaseDataLoaderIter' references 'DataLoader'.
     def __iter__(self) -> '_BaseDataLoaderIter':
-        if self.alternating_order:
-            if not (self.in_order):
-                self.dataset = self.reverse_dataset
-            else:
-                self.dataset = self.in_order_dataset
-            self.in_order = not(self.in_order)
         # When using a single worker the returned iterator should be
         # created everytime to avoid resetting its state
         # However, in the case of a multiple workers iterator
